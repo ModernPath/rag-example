@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG Compare</title>
+  <style>
+    :root {
+      --bg: #f5f6f8; --card: #ffffff; --text: #1d2330; --muted: #646d7e; --border: #e2e5ea;
+      --accent: #3b5bdb; --accent-text: #ffffff; --cited: #eef2ff;
+      --success-bg: #e6f4ea; --success-text: #1e6b34; --error-bg: #fdecea; --error-text: #8a1f11;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #14171d; --card: #1d2129; --text: #e6e9ef; --muted: #9aa3b2; --border: #2d333e;
+        --accent: #748ffc; --accent-text: #0e1116; --cited: #1f2547;
+        --success-bg: #173222; --success-text: #8fd6a4; --error-bg: #3a1a17; --error-text: #f2a79c;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+    main { max-width: 1180px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+    h1 { margin: 0 0 .25rem; font-size: 1.6rem; }
+    h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
+    .muted { color: var(--muted); }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.2rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 1rem; margin: 1rem 0; }
+    .flash { padding: .7rem 1rem; border-radius: 8px; margin: 1rem 0; }
+    .flash.success { background: var(--success-bg); color: var(--success-text); }
+    .flash.error, .error { background: var(--error-bg); color: var(--error-text); padding: .6rem .8rem; border-radius: 8px; }
+    input, button { font: inherit; color: inherit; }
+    input[type=text] { flex: 1; min-width: 0; padding: .55rem .75rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+    input[type=number] { width: 4.5rem; padding: .45rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+    button { padding: .55rem 1rem; border: none; border-radius: 8px; background: var(--accent); color: var(--accent-text); cursor: pointer; }
+    button.secondary { background: transparent; color: var(--muted); border: 1px solid var(--border); padding: .35rem .8rem; }
+    .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+    .examples a { display: inline-block; margin: .35rem .4rem 0 0; font-size: .85rem; color: var(--accent); text-decoration: none; }
+    .answer { white-space: pre-wrap; margin: .5rem 0 1rem; }
+    details { border-top: 1px solid var(--border); padding: .45rem 0; }
+    details.cited summary { font-weight: 600; }
+    details.cited { background: var(--cited); margin: 0 -.5rem; padding: .45rem .5rem; border-radius: 6px; }
+    summary { cursor: pointer; font-size: .9rem; }
+    details p { white-space: pre-wrap; font-size: .85rem; margin: .4rem 0 0; }
+    code { font-size: .85em; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>RAG Compare</h1>
+  <p class="muted">Same question, three retrieval-augmented engines: built from scratch with markdown or semantic (LLM) chunking, vs Gemini File Search.</p>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}<div class="flash {{ category }}" role="status">{{ message }}</div>{% endfor %}
+  {% endwith %}
+
+  <div class="grid">
+    {% for name, s in statuses.items() %}
+    <section class="card" data-engine="{{ name }}">
+      <div class="row" style="justify-content: space-between;">
+        <h2>{{ name }}</h2>
+        <form method="post" action="{{ url_for('run_index', name=name) }}">
+          <button type="submit" class="secondary">{{ 'Re-sync' if s.indexed else 'Index' }} sample docs</button>
+        </form>
+      </div>
+      {% if s.error %}
+        <div class="error">{{ s.error }}</div>
+      {% elif s.indexed %}
+        <div class="muted">
+          {{ s.documents|length }} document(s){% if s.chunks is defined %} · {{ s.chunks }} {{ s.chunking }} chunks · <code>{{ s.embedding_model }}</code>{% endif %}
+          {% if s.store %} · <code>{{ s.store }}</code>{% endif %}
+          {% if s.pending_documents %} · {{ s.pending_documents }} still processing{% endif %}
+        </div>
+      {% else %}
+        <div class="muted">Not indexed yet.</div>
+      {% endif %}
+    </section>
+    {% endfor %}
+  </div>
+
+  <form method="get" action="{{ url_for('index') }}" class="card" id="ask-form">
+    <div class="row">
+      <input type="text" name="q" value="{{ question }}" placeholder="Ask about the sample docs…" aria-label="Question" required autofocus>
+      <button type="submit">Ask</button>
+    </div>
+    <div class="row" style="margin-top: .6rem;">
+      {% for name in statuses %}
+      <label><input type="checkbox" name="engine" value="{{ name }}" {{ 'checked' if name in selected }}> {{ name }}</label>
+      {% endfor %}
+      <label class="muted">top-k <input type="number" name="top_k" value="{{ top_k }}" min="1" max="20"></label>
+    </div>
+    <div class="examples">
+      {% for example in examples %}<a href="{{ url_for('index', q=example) }}">{{ example }}</a>{% endfor %}
+    </div>
+  </form>
+
+  {% if results %}
+  <div class="grid">
+    {% for name, result in results.items() %}
+    <section class="card result" data-engine="{{ name }}">
+      {% if result.error %}
+        <h2>{{ name }}</h2>
+        <div class="error">{{ result.error }}</div>
+      {% else %}
+        {% set a = result.answer %}
+        <h2>{{ name }} <span class="muted" style="font-weight: 400;">· {{ '%.1f'|format(a.seconds) }}s</span></h2>
+        <div class="answer">{{ a.text }}</div>
+        <div class="muted" style="font-size: .85rem;">{{ a.sources|length }} retrieved passage(s) · highlighted = cited</div>
+        {% for s in a.sources %}
+        <details class="{{ 'cited' if s.cited }}">
+          <summary>[{{ s.number }}] {{ s.title }}{% if s.score is not none %} <span class="muted">· {{ '%.3f'|format(s.score) }}</span>{% endif %}</summary>
+          <p>{{ s.text }}</p>
+        </details>
+        {% endfor %}
+      {% endif %}
+    </section>
+    {% endfor %}
+  </div>
+  {% endif %}
+</main>
+</body>
+</html>

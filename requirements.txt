@@ -1,0 +1,7 @@
+google-genai>=2.27.0   # File Search store embedding_model config needs 2.27+
+numpy>=1.26
+chromadb>=1.0   # open-source vector database, embedded mode (no server)
+python-dotenv>=1.0.0
+flask>=3.0.0
+# Tests
+pytest>=7.0.0
