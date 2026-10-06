@@ -20,8 +20,9 @@ import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
+import translation
 from rag_common import (
     ANSWER_RULES,
     Answer,
@@ -34,6 +35,7 @@ from rag_common import (
     get_client,
     plan_sync,
 )
+from translation import Query, Translator, base_language, reply_language_rule
 
 STORE_DISPLAY_NAME = "rag-example-sample-docs"
 MAX_TOKENS_PER_CHUNK = 300
@@ -45,9 +47,12 @@ POLL_SECONDS = 2
 class FileSearchEngine:
     name = "file-search"
 
-    def __init__(self, directory: Optional[Path] = None, *, client: Any = None) -> None:
+    def __init__(
+        self, directory: Optional[Path] = None, *, client: Any = None, translator: Optional[Translator] = None
+    ) -> None:
         self.directory = Path(directory) if directory else data_dir() / "file_search"
         self._client = client
+        self.translate = translator or translation.default_translator()
 
     @property
     def client(self) -> Any:
@@ -138,7 +143,7 @@ class FileSearchEngine:
 
     # -- querying ----------------------------------------------------------- #
 
-    def ask(self, question: str, *, top_k: int = 5) -> Answer:
+    def ask(self, question: Union[str, Query], *, top_k: int = 5) -> Answer:
         from google.genai import types
 
         store_name = self._load_state().get("store_name")
@@ -146,11 +151,12 @@ class FileSearchEngine:
             raise ValueError("The File Search store is empty. Run indexing first.")
 
         started = time.perf_counter()
+        query = question if isinstance(question, Query) else self.translate(question)
         response = self.client.models.generate_content(
             model=generation_model(),
-            contents=question,
+            contents=query.text,  # retrieval happens server-side, so it also sees the base language
             config=types.GenerateContentConfig(
-                system_instruction=ANSWER_RULES,
+                system_instruction=f"{ANSWER_RULES}\n{reply_language_rule(query)}",
                 tools=[
                     types.Tool(
                         file_search=types.FileSearch(file_search_store_names=[store_name], top_k=top_k)
@@ -163,7 +169,7 @@ class FileSearchEngine:
         metadata = response.candidates[0].grounding_metadata if response.candidates else None
         sources = sources_from_grounding(metadata)
         text = insert_citations(response.text or "", metadata)
-        return Answer(self.name, question, text.strip(), sources, time.perf_counter() - started)
+        return Answer(self.name, query.original, text.strip(), sources, time.perf_counter() - started, query=query)
 
     # -- housekeeping ------------------------------------------------------- #
 
@@ -177,6 +183,7 @@ class FileSearchEngine:
             "active_documents": int(getattr(store, "active_documents_count", 0) or 0),
             "pending_documents": int(getattr(store, "pending_documents_count", 0) or 0),
             "size_bytes": int(getattr(store, "size_bytes", 0) or 0),
+            "base_language": base_language(),
             "store": state.get("store_name"),
         }
 

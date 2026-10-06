@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
 import pytest
-from conftest import RAG_DIR
+from conftest import RAG_DIR, FakeTranslator
 
+import rag
 from rag_common import Answer, IndexReport, Source, load_documents
+from translation import Query
 from ui.app import create_app
 
 
@@ -23,8 +26,10 @@ class FakeEngine:
     def ask(self, question, *, top_k=5):
         if self.fail:
             raise RuntimeError(f"{self.name} is down")
+        self.asked = question
+        query = question if isinstance(question, Query) else Query(question, "en", question, "en")
         source = Source(1, "doc.md", "Doc > Section", "passage text", score=0.8, cited=True)
-        return Answer(self.name, question, f"{self.name} says hi [1]", [source], 0.2)
+        return Answer(self.name, query.original, f"{self.name} says hi [1]", [source], 0.2, query=query)
 
     def status(self):
         return {"engine": self.name, "indexed": self.indexed_docs > 0, "documents": ["doc.md"] * self.indexed_docs}
@@ -39,8 +44,13 @@ def engines():
 
 
 @pytest.fixture
-def client(engines):
-    app = create_app(engines)
+def translator():
+    return FakeTranslator({"Montako lomapäivää?": ("fi", "How many vacation days?")})
+
+
+@pytest.fixture
+def client(engines, translator):
+    app = create_app(engines, translator=translator)
     app.config["TESTING"] = True
     return app.test_client()
 
@@ -71,9 +81,42 @@ def test_ask_selected_engine_only(client):
     assert "file-search is down" not in page
 
 
+def test_ui_translates_once_and_shows_the_translation(client, engines, translator):
+    page = client.get("/?q=Montako+lomapäivää%3F&engine=scratch").get_data(as_text=True)
+    assert translator.calls == ["Montako lomapäivää?"]  # one call shared by all engines
+    assert engines["scratch"].asked == Query("Montako lomapäivää?", "fi", "How many vacation days?", "en")
+    assert "Translated from Finnish to English" in page and "How many vacation days?" in page
+
+
+def test_ui_shows_no_translation_line_for_base_language_questions(client):
+    page = client.get("/?q=hello&engine=scratch").get_data(as_text=True)
+    assert "Translated from" not in page
+    assert "Base language: <code>en</code>" in page
+
+
+def test_cli_ask_and_search_print_the_translation(monkeypatch, capsys, translator):
+    engine = FakeEngine("scratch")
+    engine.retrieve = lambda question, top_k=5: [Source(1, "doc.md", "Doc", "passage", score=0.7)]
+    monkeypatch.setattr(rag, "make_engines", lambda choice: [engine])
+    monkeypatch.setattr(rag, "make_translator", lambda: translator)
+
+    assert rag.main(["ask", "Montako lomapäivää?"]) == 0
+    out = capsys.readouterr().out
+    assert "Translated (fi → en): How many vacation days?" in out and "scratch says hi [1]" in out
+    assert engine.asked.text == "How many vacation days?"
+
+    assert rag.main(["search", "Montako lomapäivää?"]) == 0
+    assert "Translated (fi → en): How many vacation days?" in capsys.readouterr().out
+
+    assert rag.main(["ask", "hello"]) == 0
+    assert "Translated" not in capsys.readouterr().out
+
+
 def test_cli_help_and_empty_index():
+    # The CLI translates the question before the engine reports an empty index; keep that offline.
+    env = {**os.environ, "RAG_TRANSLATE_QUERIES": "0"}
     run = lambda *args: subprocess.run(  # noqa: E731
-        [sys.executable, str(RAG_DIR / "rag.py"), *args], capture_output=True, text=True, timeout=60
+        [sys.executable, str(RAG_DIR / "rag.py"), *args], capture_output=True, text=True, timeout=60, env=env
     )
     assert "vs Gemini File Search" in run("--help").stdout
 

@@ -15,14 +15,36 @@ import pytest
 RAG_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RAG_DIR))
 
+import translation  # noqa: E402
 from rag_common import Document  # noqa: E402
 from scratch.embedder import normalize  # noqa: E402
+from translation import Query  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def isolated_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("RAG_DATA_DIR", str(tmp_path / "data"))
     return tmp_path / "data"
+
+
+@pytest.fixture(autouse=True)
+def offline_translation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Engines built without an explicit translator must not call Gemini in tests."""
+    monkeypatch.setattr(translation, "default_translator", lambda: translation.passthrough)
+
+
+class FakeTranslator:
+    """Fixed translations into the base language; anything else counts as already translated."""
+
+    def __init__(self, translations: Dict[str, tuple], base: str = "en") -> None:
+        self.translations = translations  # original -> (language, text in base language)
+        self.base = base
+        self.calls: List[str] = []
+
+    def __call__(self, question: str) -> Query:
+        self.calls.append(question)
+        language, text = self.translations.get(question, (self.base, question))
+        return Query(original=question, language=language, text=text, base_language=self.base)
 
 
 @pytest.fixture
@@ -73,9 +95,11 @@ class FakeGenerator:
 
     def __init__(self) -> None:
         self.prompts: List[str] = []
+        self.systems: List[str] = []
 
     def __call__(self, prompt: str, *, system: str) -> str:
         self.prompts.append(prompt)
+        self.systems.append(system)
         return "Answer from the documents [1]."
 
 
@@ -97,6 +121,7 @@ class FakeFileSearchClient:
         self.deleted_documents: List[str] = []
         self.grounding = None
         self.answer_text = ""
+        self.generate_calls: List[dict] = []
 
         self.file_search_stores = SimpleNamespace(
             create=self._create,
@@ -131,6 +156,7 @@ class FakeFileSearchClient:
             documents.pop(name, None)
 
     def _generate(self, model, contents, config):
+        self.generate_calls.append({"model": model, "contents": contents, "config": config})
         candidate = SimpleNamespace(grounding_metadata=self.grounding)
         return SimpleNamespace(text=self.answer_text, candidates=[candidate])
 

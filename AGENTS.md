@@ -12,6 +12,7 @@
 rag-example/
 ├── rag.py                    # CLI for all engines (required entry point)
 ├── rag_common.py             # Config, Document loading, sync planning, result types, shared prompt rules
+├── translation.py            # Base language: question detection + translation (shared by all engines)
 ├── scratch/                  # From-scratch engine, one module per pipeline step
 │   ├── chunking.py           # Step 1:  markdown chunking (pure functions, no LLM)
 │   ├── semantic_chunking.py  # Step 1b: semantic chunking (LLM picks boundaries)
@@ -54,6 +55,9 @@ Never hard-code a model name in an engine.
 | Embeddings | `embedding_model()` | `RAG_EMBEDDING_MODEL` | `gemini-embedding-2` |
 | Semantic chunking | `chunking_model()` | `RAG_CHUNKING_MODEL` | `gemini-3.5-flash-lite` |
 | Data folder | `data_dir()` | `RAG_DATA_DIR` | `./data` |
+| Base language | `base_language()` (`translation.py`) | `RAG_BASE_LANGUAGE` | `en` |
+| Query translation | `translation_model()` (`translation.py`) | `RAG_TRANSLATION_MODEL` | `gemini-3.5-flash-lite` |
+| Translation on/off | `default_translator()` (`translation.py`) | `RAG_TRANSLATE_QUERIES` | `1` |
 
 API keys are read from `GOOGLE_AI_STUDIO_KEY`, `GEMINI_API_KEY`, or `GOOGLE_API_KEY`, loaded by
 `load_environment()` from `.env` / `.env.local` in this folder or any parent (closest wins).
@@ -69,7 +73,7 @@ Every engine implements the `RagEngine` protocol from `rag_common.py`:
 class RagEngine(Protocol):
     name: str                                                    # CLI/UI identifier, kebab-case
     def index(self, documents: Sequence[Document]) -> IndexReport: ...
-    def ask(self, question: str, *, top_k: int = 5) -> Answer: ...
+    def ask(self, question: str | Query, *, top_k: int = 5) -> Answer: ...
     def status(self) -> Dict[str, object]: ...                   # must not create files or remote resources
     def reset(self) -> None: ...
 ```
@@ -84,8 +88,35 @@ An engine MUST:
   every source the answer references.
 - **Raise `ValueError` or `RuntimeError` for user-facing errors** (empty index, missing key).
   The CLI and UI catch `api_errors()` and show the message instead of a traceback.
-- **Take its collaborators as constructor arguments** (embedder, generator, chunker, client) so
-  tests can pass fakes, with real Gemini implementations as defaults.
+- **Take its collaborators as constructor arguments** (embedder, generator, chunker, client,
+  translator) so tests can pass fakes, with real Gemini implementations as defaults.
+- **Work in the base language.** `ask()` and `retrieve()` accept a plain question or a `Query`.
+  A plain question is translated with the engine's `translator` (default
+  `translation.default_translator()`); a `Query` is used as-is, so the CLI and UI translate once
+  and share it. Retrieval and the prompt use `query.text` (base language); the system prompt
+  adds `reply_language_rule(query)` so the answer comes back in the question's language.
+  `Answer.question` is the original and `Answer.query` the translation. `status()` reports
+  `base_language`.
+
+---
+
+## Base Language
+
+One language, `RAG_BASE_LANGUAGE` (ISO 639-1, default `en`), is used on both sides of the index:
+
+- **Indexing:** the semantic chunker writes chunk titles in the base language whatever the
+  document's language (`segment_instructions(base)`). Chunk *text* stays verbatim: it is never
+  translated. The markdown chunker takes titles from headings, so it cannot translate them.
+- **Asking:** `translation.GeminiTranslator` detects the question's language and translates it
+  into the base language in one structured-output call. The validated result is a `Query`. When
+  the question is already in the base language the original wording is kept.
+
+Rules:
+- Read the base language only through `base_language()`; never hard-code a language.
+- Changing `RAG_BASE_LANGUAGE` changes semantic chunk titles: `reset` and re-index `scratch-semantic`.
+- Offline tests use `FakeTranslator` from `tests/conftest.py`; the autouse `offline_translation`
+  fixture makes engines built without a translator use `passthrough`. New language behavior
+  needs a pure function (like `parse_translation`) that tests can cover without an API key.
 
 ---
 
@@ -145,6 +176,8 @@ These rules come from bugs found while building this project (details in README 
 `rag.py` is the single CLI. New features get a subcommand or a flag there, not a new script.
 
 - `--engine` accepts the registered engine names plus `all`.
+- `ask` and `search` translate the question once (`translate()` in `rag.py`) and print
+  `Translated (xx → base): ...` when it changed, before any engine output.
 - Debug commands that skip the LLM (`search`, `chunks`) are part of the teaching value: keep them
   working for every scratch engine.
 - Exit codes: 0 on success, 1 on a user-facing error printed to stderr as `Error: ...`.
@@ -164,6 +197,8 @@ python rag.py reset  --engine ...
 
 - `create_app(engines)` takes the engines as a mapping, so tests can pass fakes.
 - Engines run in parallel; one engine failing MUST NOT break the others' results.
+- The question is translated once (`create_app(..., translator=)`) and the `Query` is passed to
+  every engine. Show the translation above the results when it differs from the question.
 - Every registered engine appears as a status card and a selectable checkbox.
 - Port 5020 (override with `PORT`). Colors are CSS variables with a dark-mode variant, and the
   layout must work at phone width.
@@ -196,6 +231,8 @@ RAG_LIVE_TESTS=1 pytest tests/test_live.py      # real Gemini API
 - Include specific, checkable facts (numbers, limits, deadlines) so answers can be verified.
 - Don't contradict facts in existing documents.
 - Supported formats are `.md` and `.txt` (see `SUPPORTED_SUFFIXES`).
+- `tyosuhde-edut.md` is in Finnish on purpose: it shows base-language titles and cross-language
+  questions. Keep at least one non-English document.
 
 ---
 

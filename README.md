@@ -40,17 +40,19 @@ python ui/app.py                       # http://localhost:5020 — compare side 
 
 The sample corpus in `sample_docs/` is a fictional company's handbook, travel policy,
 IT security policy, and product FAQ (tidy markdown), plus an office guide copied from an
-intranet web page (plain text, no headings, menu and footer included). Each has specific
-facts (hotel caps, SLA percentages, deadlines), so you can check whether an answer is correct.
+intranet web page (plain text, no headings, menu and footer included) and a benefits page
+written in Finnish. Each has specific facts (hotel caps, SLA percentages, deadlines), so
+you can check whether an answer is correct.
 
 ## The pipeline
 
 ```
            INDEX (once, and again when documents change)
- documents ──► chunk ──► embed ──► store
-                                     │
-           ASK (every question)      ▼
- question ──► embed ──► retrieve top-k ──► prompt with numbered passages ──► LLM ──► answer + [n] citations
+ documents ──► chunk (titles in the base language) ──► embed ──► store
+                                                                   │
+           ASK (every question)                                    ▼
+ question ──► translate to the base language ──► embed ──► retrieve top-k ──► prompt with numbered passages ──► LLM ──► answer + [n] citations
+                                                                                                                 (replies in the question's language)
 ```
 
 ### From scratch: read the code in this order
@@ -110,6 +112,34 @@ On the tidy markdown docs both strategies cut at roughly the same places. The tr
 one LLM call per document at index time (~3 s per document, run in parallel) and boundaries
 that can vary a little between runs.
 
+### One base language: `translation.py`
+
+Embeddings are multilingual, but not symmetric: a Finnish question against English passages
+scores lower than the same question in English, so thresholds and top-k drift per language.
+And the semantic chunker writes titles that are embedded with the text. So the index has one
+**base language** (`RAG_BASE_LANGUAGE`, default `en`), used on both sides:
+
+- **Index:** the semantic chunker writes every chunk title in the base language, even for
+  `tyosuhde-edut.md`, which is in Finnish. Chunk text is never translated: answers quote the
+  source as written.
+- **Ask:** one small structured-output call (`gemini-3.5-flash-lite`) detects the question's
+  language and translates it into the base language. Retrieval and the grounded prompt use
+  the translation; the system prompt tells the model to reply in the language the question
+  was asked in. If the question is already in the base language, the original wording is kept.
+
+```bash
+python rag.py ask "Montako lomapäivää saan neljän vuoden jälkeen?" --engine all
+# Translated (fi → en): How many vacation days do I get after four years?
+# ── scratch (2.1s) ────  Neljän vuoden jälkeen saat 30 lomapäivää. [1]
+python rag.py search "How much is the bicycle benefit per year?" --engine scratch-semantic
+# [1] score=0.71  tyosuhde-edut.md — Employee benefits - Company bicycle   <- English title, Finnish text
+```
+
+The CLI and UI translate once and hand the same `Query` to every engine, so the comparison
+stays fair and you pay for one translation. `RAG_TRANSLATE_QUERIES=0` skips the call when
+you know your questions are already in the base language. Changing the base language changes
+the semantic chunk titles, so `reset` and re-index `scratch-semantic` afterwards.
+
 ### Gemini File Search: `file_search/engine.py`
 
 ```python
@@ -155,8 +185,8 @@ interaction = client.interactions.create(
 
 ```bash
 python rag.py index  [--engine scratch|scratch-semantic|file-search|all] [--docs FOLDER]
-python rag.py ask    "question" [--engine ...] [--top-k 5] [--no-sources]
-python rag.py search "question" [--engine scratch|scratch-semantic] [--top-k 5]   # chunks + scores, no LLM
+python rag.py ask    "question" [--engine ...] [--top-k 5] [--no-sources]       # any language
+python rag.py search "question" [--engine scratch|scratch-semantic] [--top-k 5]   # chunks + scores, no answer LLM call
 python rag.py chunks FILE [--engine scratch|scratch-semantic]                      # preview chunking, no index
 python rag.py status [--engine ...]
 python rag.py reset  --engine ...                     # file-search: deletes the remote store
@@ -172,6 +202,9 @@ to PDFs is a good exercise.
 | `RAG_EMBEDDING_MODEL` | `gemini-embedding-2` | Embedding model (scratch + new File Search stores) |
 | `RAG_CHUNKING_MODEL` | `gemini-3.5-flash-lite` | Model that picks chunk boundaries for `scratch-semantic` |
 | `RAG_DATA_DIR` | `./data` | Where indexes and store state live |
+| `RAG_BASE_LANGUAGE` | `en` | ISO 639-1 code of the index: semantic chunk titles and translated questions |
+| `RAG_TRANSLATION_MODEL` | `gemini-3.5-flash-lite` | Detects the question's language and translates it |
+| `RAG_TRANSLATE_QUERIES` | `1` | `0` skips translation (questions are assumed to be in the base language) |
 
 ## Tests
 
@@ -223,7 +256,12 @@ RAG_LIVE_TESTS=1 pytest tests/test_live.py      # real API; creates and deletes 
 6. **Make it agent memory.** Wrap `ScratchEngine.retrieve()` as a function tool for a
    Gemini agent (automatic function calling with a Python callable), so the agent decides
    when to look things up and cites what it found.
-7. **Swap the vector store.** Point Chroma at a server (`chromadb.HttpClient`, run with
+7. **Cross-language retrieval.** Run `rag.py search "bicycle benefit" --engine scratch` and
+   `--engine scratch-semantic`: the markdown chunker keeps the Finnish heading as the title,
+   the semantic chunker wrote an English one. Then set `RAG_TRANSLATE_QUERIES=0` and ask the
+   Finnish question again. How much does the score drop without translation? Try
+   `RAG_BASE_LANGUAGE=fi` (reset and re-index `scratch-semantic` first).
+8. **Swap the vector store.** Point Chroma at a server (`chromadb.HttpClient`, run with
    `chroma run --path ./chroma-data`), or implement `ChromaVectorStore`'s six methods on
    Qdrant, LanceDB, or pgvector, without changing `engine.py`.
 
@@ -234,10 +272,11 @@ rag-example/
 ├── AGENTS.md               # rules for extending this project (engines, chunkers, stores, tests)
 ├── rag.py                  # CLI for all engines
 ├── rag_common.py           # config, Document loading, sync planning, Answer/Source types
+├── translation.py          # base language: detect + translate questions, title language for chunks
 ├── scratch/                # chunking.py | semantic_chunking.py → embedder.py → vector_store.py → engine.py
 ├── file_search/engine.py   # store sync, FileSearch tool, grounding → citations
 ├── ui/app.py               # Flask side-by-side comparison (port 5020)
-├── sample_docs/            # fictional company documents (markdown + one web page as text)
+├── sample_docs/            # fictional company documents (markdown + one web page as text + one in Finnish)
 ├── data/                   # ChromaDB files + File Search state (gitignored)
 ├── .env.example            # copy to .env and set GEMINI_API_KEY
 ├── requirements.txt

@@ -11,7 +11,8 @@ Usage:
   python rag.py index                              # scratch engine (default)
   python rag.py index --engine all                 # all three engines
   python rag.py ask "How many vacation days do I get?" --engine all
-  python rag.py search "hotel limit in London"     # scratch retrieval only, no LLM
+  python rag.py search "hotel limit in London"     # scratch retrieval only, no answer LLM call
+  python rag.py ask "Montako lomapäivää saan?"     # translated into the base language first
   python rag.py search "hotel limit" --engine scratch-semantic
   python rag.py chunks travel-and-expenses.md --engine scratch-semantic   # preview chunking
   python rag.py status
@@ -29,6 +30,7 @@ from typing import Callable, Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import translation  # noqa: E402
 from rag_common import (  # noqa: E402
     DEFAULT_DOCS_DIR,
     Answer,
@@ -37,6 +39,7 @@ from rag_common import (  # noqa: E402
     load_documents,
     load_environment,
 )
+from translation import Query, Translator  # noqa: E402
 
 SCRATCH_ENGINES = ("scratch", "scratch-semantic")
 ENGINE_CHOICES = (*SCRATCH_ENGINES, "file-search", "all")
@@ -54,6 +57,18 @@ def make_engines(choice: str) -> List[RagEngine]:
     }
     names = factories if choice == "all" else [choice]
     return [factories[name]() for name in names]
+
+
+def make_translator() -> Translator:
+    return translation.default_translator()
+
+
+def translate(question: str) -> Query:
+    """Translate once up front so every engine (and the printout) shares the same query."""
+    query = make_translator()(question)
+    if query.translated:
+        print(f"Translated ({query.language} → {query.base_language}): {query.text}")
+    return query
 
 
 def print_answer(answer: Answer, *, show_sources: bool) -> None:
@@ -109,11 +124,12 @@ def main(argv: List[str] | None = None) -> int:
                 print(engine.index(documents).summary())
 
         elif args.command == "ask":
+            query = translate(args.question)
             for engine in make_engines(args.engine):
-                print_answer(engine.ask(args.question, top_k=args.top_k), show_sources=not args.no_sources)
+                print_answer(engine.ask(query, top_k=args.top_k), show_sources=not args.no_sources)
 
         elif args.command == "search":
-            sources = make_engines(args.engine)[0].retrieve(args.question, top_k=args.top_k)
+            sources = make_engines(args.engine)[0].retrieve(translate(args.question), top_k=args.top_k)
             if not sources:
                 print("No chunk scored above the similarity threshold.")
             for s in sources:

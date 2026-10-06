@@ -47,7 +47,8 @@
 <body>
 <main>
   <h1>RAG Compare</h1>
-  <p class="muted">Same question, three retrieval-augmented engines: built from scratch with markdown or semantic (LLM) chunking, vs Gemini File Search.</p>
+  <p class="muted">Same question, three retrieval-augmented engines: built from scratch with markdown or semantic (LLM) chunking, vs Gemini File Search.
+    Base language: <code>{{ base_language }}</code> — chunk titles are written in it and questions are translated into it before retrieval.</p>
 
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% for category, message in messages %}<div class="flash {{ category }}" role="status">{{ message }}</div>{% endfor %}
@@ -92,6 +93,11 @@
       {% for example in examples %}<a href="{{ url_for('index', q=example) }}">{{ example }}</a>{% endfor %}
     </div>
   </form>
+
+  {% if translation_error %}<div class="flash error" role="status">Translation failed: {{ translation_error }}</div>{% endif %}
+  {% if query and query.translated %}
+  <div class="flash success" role="status">Translated from {{ language_name(query.language) }} to {{ language_name(query.base_language) }}: <strong>{{ query.text }}</strong></div>
+  {% endif %}
 
   {% if results %}
   <div class="grid">

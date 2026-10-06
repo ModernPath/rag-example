@@ -17,8 +17,9 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
+import translation
 from rag_common import (
     ANSWER_RULES,
     NOT_FOUND_REPLY,
@@ -34,6 +35,7 @@ from scratch.chunking import Chunk, chunk_markdown
 from scratch.embedder import Embedder, GeminiEmbedder
 from scratch.semantic_chunking import SemanticChunker
 from scratch.vector_store import ChromaVectorStore
+from translation import Query, Translator, base_language, reply_language_rule
 
 # Below this cosine similarity a chunk is treated as unrelated to the question.
 # Model-specific: with gemini-embedding-2 (768 dims) on the sample docs, relevant
@@ -61,6 +63,7 @@ class ScratchEngine:
         chunker: Chunker = chunk_markdown,
         embedder: Optional[Embedder] = None,
         generate: Optional[Generate] = None,
+        translator: Optional[Translator] = None,
         min_score: float = DEFAULT_MIN_SCORE,
     ) -> None:
         self.name = name
@@ -68,6 +71,7 @@ class ScratchEngine:
         self.directory = Path(directory) if directory else data_dir() / name
         self.embedder = embedder or GeminiEmbedder()
         self.generate = generate or generate_text
+        self.translate = translator or translation.default_translator()
         self.min_score = min_score
 
     # -- indexing ----------------------------------------------------------- #
@@ -103,26 +107,34 @@ class ScratchEngine:
 
     # -- querying ----------------------------------------------------------- #
 
-    def retrieve(self, question: str, *, top_k: int = 5) -> List[Source]:
-        """Retrieval only, no LLM: useful for debugging what the model will see."""
+    def retrieve(self, question: Union[str, Query], *, top_k: int = 5) -> List[Source]:
+        """Retrieval only, no answer LLM call: useful for debugging what the model will see.
+
+        The question is translated into the base language first (pass a Query to skip that)."""
         store = self._open_store()
         if not len(store):
             raise ValueError("The scratch index is empty. Run indexing first.")
-        hits = store.search(self.embedder.embed_query(question), top_k=top_k, min_score=self.min_score)
+        query = self._query(question)
+        hits = store.search(self.embedder.embed_query(query.text), top_k=top_k, min_score=self.min_score)
         return [
             Source(number=i, document=c.document, title=c.title, text=c.text, score=round(score, 4))
             for i, (c, score) in enumerate(hits, start=1)
         ]
 
-    def ask(self, question: str, *, top_k: int = 5) -> Answer:
+    def ask(self, question: Union[str, Query], *, top_k: int = 5) -> Answer:
         started = time.perf_counter()
-        sources = self.retrieve(question, top_k=top_k)
+        query = self._query(question)
+        sources = self.retrieve(query, top_k=top_k)
         if sources:
-            text = self.generate(build_prompt(question, sources), system=f"{ANSWER_RULES}\n{CITATION_RULES}")
+            system = f"{ANSWER_RULES}\n{CITATION_RULES}\n{reply_language_rule(query)}"
+            text = self.generate(build_prompt(query.text, sources), system=system)
             mark_cited(text, sources)
         else:
             text = NOT_FOUND_REPLY  # nothing relevant retrieved: skip the LLM call
-        return Answer(self.name, question, text, sources, time.perf_counter() - started)
+        return Answer(self.name, query.original, text, sources, time.perf_counter() - started, query=query)
+
+    def _query(self, question: Union[str, Query]) -> Query:
+        return question if isinstance(question, Query) else self.translate(question)
 
     # -- housekeeping ------------------------------------------------------- #
 
@@ -135,6 +147,7 @@ class ScratchEngine:
             "chunks": len(store) if store else 0,
             "chunking": self._chunker_id(),
             "embedding_model": self._embedder_id(),
+            "base_language": base_language(),
             "location": str(self.directory),
         }
 

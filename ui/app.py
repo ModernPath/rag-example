@@ -18,7 +18,9 @@ from flask import Flask, flash, redirect, render_template, request, url_for
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import translation  # noqa: E402
 from rag_common import RagEngine, api_errors, load_documents, load_environment  # noqa: E402
+from translation import Query, Translator, base_language, language_name  # noqa: E402
 
 DEFAULT_PORT = 5020
 DEFAULT_TOP_K = 5
@@ -28,6 +30,8 @@ EXAMPLE_QUESTIONS = (
     "Which Northstar plan do I need for SSO, and what is its uptime SLA?",
     "What should I do if I lose my laptop?",
     "Can I bring a visitor to the Helsinki office?",
+    "Montako lomapäivää saan neljän vuoden jälkeen?",
+    "How much is the bicycle benefit per year?",
     "What is the capital of Peru?",
 )
 
@@ -40,11 +44,12 @@ def default_engines() -> Dict[str, RagEngine]:
     return {engine.name: engine for engine in engines}
 
 
-def create_app(engines: Optional[Mapping[str, RagEngine]] = None) -> Flask:
-    """App factory: pass fake engines in tests."""
+def create_app(engines: Optional[Mapping[str, RagEngine]] = None, *, translator: Optional[Translator] = None) -> Flask:
+    """App factory: pass fake engines (and a fake translator) in tests."""
     app = Flask(__name__)
     app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET", "rag-example-dev-secret")
     engines = dict(engines or default_engines())
+    translate = translator or translation.default_translator()
     errors = api_errors()
 
     def safe_status(engine: RagEngine) -> dict:
@@ -53,9 +58,9 @@ def create_app(engines: Optional[Mapping[str, RagEngine]] = None) -> Flask:
         except errors as exc:
             return {"engine": engine.name, "indexed": False, "error": str(exc)}
 
-    def ask_one(engine: RagEngine, question: str, top_k: int) -> dict:
+    def ask_one(engine: RagEngine, query: Query, top_k: int) -> dict:
         try:
-            return {"answer": engine.ask(question, top_k=top_k)}
+            return {"answer": engine.ask(query, top_k=top_k)}
         except errors as exc:
             return {"error": str(exc)}
 
@@ -70,11 +75,18 @@ def create_app(engines: Optional[Mapping[str, RagEngine]] = None) -> Flask:
         top_k = request.args.get("top_k", DEFAULT_TOP_K, type=int)
 
         results: Dict[str, dict] = {}
+        query: Optional[Query] = None
+        translation_error: Optional[str] = None
         if question:
+            try:
+                query = translate(question)  # once, shared by every engine
+            except errors as exc:
+                translation_error = str(exc)
+        if query is not None:
             chosen = [engines[name] for name in selected if name in engines]
             # Engines are independent network calls: run them in parallel.
             with ThreadPoolExecutor(max_workers=len(chosen) or 1) as pool:
-                futures = {e.name: pool.submit(ask_one, e, question, top_k) for e in chosen}
+                futures = {e.name: pool.submit(ask_one, e, query, top_k) for e in chosen}
             results = {name: future.result() for name, future in futures.items()}
 
         return render_template(
@@ -84,6 +96,10 @@ def create_app(engines: Optional[Mapping[str, RagEngine]] = None) -> Flask:
             selected=selected,
             top_k=top_k,
             results=results,
+            query=query,
+            translation_error=translation_error,
+            base_language=base_language(),
+            language_name=language_name,
             examples=EXAMPLE_QUESTIONS,
         )
 

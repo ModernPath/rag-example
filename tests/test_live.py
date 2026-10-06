@@ -56,3 +56,32 @@ def test_semantic_chunker_keeps_text_verbatim():
     assert len(chunks) >= 3
     assert all(c.text in text and c.title for c in chunks)
     assert any("230" in c.text and "hotel" in c.title.lower() for c in chunks)
+
+
+def test_questions_in_another_language_are_translated_and_answered_in_kind(engines):
+    for engine in engines:
+        answer = engine.ask("Montako lomapäivää saan neljän vuoden jälkeen?")
+        assert answer.query.language == "fi" and answer.query.translated, answer.query
+        assert "vacation" in answer.query.text.lower(), answer.query
+        assert "30" in answer.text, f"{engine.name}: {answer.text}"
+        assert "lomap" in answer.text.lower(), f"{engine.name} did not reply in Finnish: {answer.text}"
+
+
+def test_base_language_question_finds_finnish_document(engines):
+    for engine in engines:
+        answer = engine.ask("How much is the bicycle benefit per year?")
+        assert not answer.query.translated
+        assert "1 200" in answer.text or "1200" in answer.text or "1,200" in answer.text, f"{engine.name}: {answer.text}"
+        assert any(s.document.startswith("tyosuhde-edut") and s.cited for s in answer.sources), engine.name
+
+
+def test_semantic_chunker_titles_finnish_document_in_base_language():
+    load_environment()
+    from scratch.semantic_chunking import SemanticChunker
+
+    text = (DEFAULT_DOCS_DIR / "tyosuhde-edut.md").read_text(encoding="utf-8")
+    chunks = SemanticChunker(base="en")("tyosuhde-edut.md", text)
+    assert all(c.text in text for c in chunks)
+    titles = " ".join(c.title.lower() for c in chunks)
+    assert "bicycle" in titles or "bike" in titles, titles
+    assert "polkupyörä" not in titles, titles

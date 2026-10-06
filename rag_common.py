@@ -10,7 +10,10 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, Sequence, Union
+
+if TYPE_CHECKING:  # translation imports get_client from here, so only type-import back
+    from translation import Query
 
 RAG_DIR = Path(__file__).resolve().parent
 DEFAULT_DOCS_DIR = RAG_DIR / "sample_docs"
@@ -166,10 +169,11 @@ class Source:
 @dataclass
 class Answer:
     engine: str
-    question: str
+    question: str  # as the user asked it
     text: str
     sources: List[Source]
     seconds: float
+    query: Optional["Query"] = None  # the question in the base language (see translation.py)
 
 
 @dataclass
@@ -193,7 +197,7 @@ class RagEngine(Protocol):
 
     def index(self, documents: Sequence[Document]) -> IndexReport: ...
 
-    def ask(self, question: str, *, top_k: int = 5) -> Answer: ...
+    def ask(self, question: Union[str, "Query"], *, top_k: int = 5) -> Answer: ...
 
     def status(self) -> Dict[str, object]: ...
 

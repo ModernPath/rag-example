@@ -32,6 +32,7 @@ from typing import Callable, Dict, List, Sequence, Tuple
 
 from rag_common import chunking_model, get_client
 from scratch.chunking import DEFAULT_MAX_CHARS, Chunk, pack_paragraphs, split_paragraphs
+from translation import base_language, language_name
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
@@ -59,6 +60,16 @@ starts, a title, and whether it is boilerplate.
   cookie or copyright notices. Everything else gets skip=false.
 """
 
+
+def segment_instructions(base: str) -> str:
+    """The chunking prompt, with titles in the base language whatever language the document is in.
+
+    Titles are embedded with the chunk text, so one title language keeps the index consistent
+    (see translation.py). Say it even for English: left alone, the model titles a Finnish
+    document in Finnish."""
+    name = language_name(base)
+    return SEGMENT_INSTRUCTIONS + f"- Write every title in {name}, even when the document is in another language.\n"
+
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -84,8 +95,15 @@ class SemanticChunker:
 
     name = "semantic"
 
-    def __init__(self, *, segment: Segmenter | None = None, max_chars: int = DEFAULT_MAX_CHARS) -> None:
-        self.segment = segment or gemini_segmenter
+    def __init__(
+        self,
+        *,
+        segment: Segmenter | None = None,
+        max_chars: int = DEFAULT_MAX_CHARS,
+        base: str | None = None,
+    ) -> None:
+        self.base_language = base or base_language()
+        self.segment = segment or gemini_segmenter(self.base_language)
         self.max_chars = max_chars
 
     def __call__(self, document: str, text: str) -> List[Chunk]:
@@ -112,26 +130,31 @@ def split_sentences(text: str) -> List[Tuple[int, str]]:
     return sentences
 
 
-def gemini_segmenter(document: str, numbered: str) -> List[Boundary]:
-    """Ask the chunking model for chunk starts, titles, and boilerplate flags (structured JSON)."""
-    from google.genai import types
+def gemini_segmenter(base: str) -> Segmenter:
+    """A segmenter that asks the chunking model for chunk starts, titles (in the base language),
+    and boilerplate flags as structured JSON."""
 
-    client = get_client()
-    response = client.models.generate_content(
-        model=chunking_model(),
-        contents=f"Document: {document}\n\n{numbered}",
-        config=types.GenerateContentConfig(
-            system_instruction=SEGMENT_INSTRUCTIONS,
-            response_mime_type="application/json",
-            response_json_schema=RESPONSE_SCHEMA,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        ),
-    )
-    try:
-        chunks = json.loads(response.text or "")["chunks"]
-        return [Boundary(int(c["start"]), str(c["title"]).strip(), bool(c.get("skip"))) for c in chunks]
-    except (ValueError, KeyError, TypeError) as exc:
-        raise ValueError(f"Semantic chunking of {document} returned invalid JSON: {exc}") from exc
+    def segment(document: str, numbered: str) -> List[Boundary]:
+        from google.genai import types
+
+        client = get_client()
+        response = client.models.generate_content(
+            model=chunking_model(),
+            contents=f"Document: {document}\n\n{numbered}",
+            config=types.GenerateContentConfig(
+                system_instruction=segment_instructions(base),
+                response_mime_type="application/json",
+                response_json_schema=RESPONSE_SCHEMA,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            ),
+        )
+        try:
+            chunks = json.loads(response.text or "")["chunks"]
+            return [Boundary(int(c["start"]), str(c["title"]).strip(), bool(c.get("skip"))) for c in chunks]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"Semantic chunking of {document} returned invalid JSON: {exc}") from exc
+
+    return segment
 
 
 def chunks_from_boundaries(
